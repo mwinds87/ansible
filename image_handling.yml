@@ -1,0 +1,40 @@
+---
+- name: 載入 required_images.txt 內容
+  slurp:
+    src: "{{ offline_dir }}/required_images.txt"
+  register: images_content
+  delegate_to: localhost # 在 Ansible 控制機上執行
+
+- name: 轉換 images_content 為列表
+  set_fact:
+    image_list: "{{ images_content.content | b64decode | split('\n') | reject('equalto', '') | list }}"
+
+- name: 處理每個鏡像 (拉取, 標記, 清理)
+  shell: |
+    IMAGE="{{ item }}"
+    ACCELERATOR_PREFIX="{{ k8s_accelerator }}"
+    
+    if echo "$IMAGE" | grep -q "registry.k8s.io"; then
+        # K8s 核心鏡像：使用加速器並重新標記
+        if echo "$IMAGE" | grep -q "coredns"; then
+          ACCELERATED_IMAGE="${ACCELERATOR_PREFIX}/coredns:v1.12.1"
+        else
+          ACCELERATED_IMAGE=$(echo $IMAGE | sed "s|registry.k8s.io|${ACCELERATOR_PREFIX}|g")
+        fi
+        
+        docker pull "$ACCELERATED_IMAGE"
+        docker tag "$ACCELERATED_IMAGE" "$IMAGE"
+        docker rmi "$ACCELERATED_IMAGE"
+    elif echo "$IMAGE" | grep -q "docker.io"; then
+        # Calico CNI 鏡像：直接拉取
+        docker pull "$IMAGE"
+    fi
+  loop: "{{ image_list }}"
+  register: image_pull_results
+
+- name: 將所有鏡像打包成 tar
+  shell: "docker save $(cat {{ offline_dir }}/required_images.txt) -o {{ offline_dir }}/k8s_calico_images_{{ k8s_version }}.tar.gz"
+
+- name: 報告鏡像處理結果
+  debug:
+    msg: "鏡像打包完成。"

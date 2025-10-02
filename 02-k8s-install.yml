@@ -1,0 +1,97 @@
+---
+- name: 階段二：K8s 集群離線安裝與部署 (使用 Calico Operator)
+  hosts: K8S-Nodes
+  become: yes
+  vars:
+    k8s_version: "v1.34.1"
+    kube_version: "1.34.1"
+    offline_dir: "/home/administrator/kubernetes/offline"
+    pkg_dir: "{{ offline_dir }}/offline_packages"
+    pod_network_cidr: "192.168.0.0/16"
+    master_ip: "192.168.1.10" # 請修改為 Master 節點的內部 IP
+
+  tasks:
+    - name: 1. 解壓縮離線資源包
+      unarchive:
+        src: "{{ offline_dir }}/k8s_offline_bundle_{{ k8s_version }}.tar.gz"
+        dest: "{{ offline_dir }}"
+        remote_src: yes
+      delegate_to: "{{ inventory_hostname }}"
+
+    - name: 2. 系統前置配置 (關閉 Swap)
+      ansible.builtin.shell: |
+        swapoff -a
+        sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+
+    - name: 3. 系統前置配置 (網路模組與 Sysctl)
+      ansible.builtin.shell: |
+        cat <<EOF | tee /etc/modules-load.d/k8s.conf
+        overlay
+        br_netfilter
+        EOF
+        modprobe overlay
+        modprobe br_netfilter
+        
+        cat <<EOF | tee /etc/sysctl.d/k8s.conf
+        net.bridge.bridge-nf-call-iptables  = 1
+        net.bridge.bridge-nf-call-ip6tables = 1
+        net.ipv4.ip_forward                 = 1
+        EOF
+        sysctl --system
+
+    - name: 4. 離線安裝所有 .deb 套件
+      ansible.builtin.shell: "dpkg -i {{ pkg_dir }}/*.deb"
+      ignore_errors: yes
+
+    - name: 5. 配置 Containerd Cgroup Driver
+      ansible.builtin.shell: |
+        mkdir -p /etc/containerd
+        containerd config default | tee /etc/containerd/config.toml
+        sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
+        systemctl restart containerd
+        systemctl enable containerd
+      
+    - name: 6. 啟用 Kubelet 服務
+      systemd:
+        name: kubelet
+        state: started
+        enabled: yes
+
+    - name: 7. 導入所有 K8s 核心與 Calico 鏡像
+      ansible.builtin.shell: "docker load -i {{ offline_dir }}/k8s_calico_images_{{ k8s_version }}.tar.gz"
+      
+    # - name: 8. 【Master 節點】初始化集群
+    #   when: inventory_hostname in groups['master'] 
+    #   ansible.builtin.shell: |
+    #     kubeadm init \
+    #       --apiserver-advertise-address={{ master_ip }} \
+    #       --image-repository=registry.k8s.io \
+    #       --kubernetes-version={{ k8s_version }} \
+    #       --pod-network-cidr={{ pod_network_cidr }}
+    #   register: kubeadm_init_result
+      
+    # - name: 9. 【Master 節點】配置 Kubeconfig
+    #   when: inventory_hostname in groups['master']
+    #   ansible.builtin.shell: |
+    #     mkdir -p $HOME/.kube
+    #     cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+    #     chown {{ ansible_user_id }}:{{ ansible_user_gid }} $HOME/.kube/config
+        
+    # - name: 10. 【Master 節點】部署 Tigera Operator (新的 CNI 部署步驟 1)
+    #   when: inventory_hostname in groups['master']
+    #   ansible.builtin.shell: "kubectl apply -f {{ offline_dir }}/tigera-operator.yaml"
+    #   environment:
+    #     KUBECONFIG: /etc/kubernetes/admin.conf
+
+    # - name: 11. 【Master 節點】部署 Calico Custom Resources (新的 CNI 部署步驟 2)
+    #   when: inventory_hostname in groups['master']
+    #   # Tigera Operator 會讀取這個配置，並開始創建 Calico 的組件
+    #   ansible.builtin.shell: "kubectl apply -f {{ offline_dir }}/custom-resources.yaml"
+    #   environment:
+    #     KUBECONFIG: /etc/kubernetes/admin.conf
+
+    # - name: 12. 【Worker 節點】執行 Join 命令
+    #   when: inventory_hostname not in groups['master'] and groups['master'] is defined and groups['master'] | length > 0
+    #   ansible.builtin.shell: |
+    #     /bin/bash /tmp/kubeadm_join.sh
+    #   ignore_errors: yes
